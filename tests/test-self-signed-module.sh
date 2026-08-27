@@ -1,90 +1,123 @@
 #!/bin/bash
-# Test self-signed module-only signing certificate setup
-# Based on Red Hat documentation
+#
+# Copyright Gordon Messmer <gmessmer@redhat.com>
+#
+# Distributed under terms of the GPLv3 license.
+#
 
-set -e
+set -eu
+set -o pipefail
+export PS4='# ${BASH_SOURCE}:${LINENO} - [${SHLVL},${BASH_SUBSHELL},$?] '
 
-TEST_NAME="self-signed-module"
-WORK_DIR=$(mktemp -d)
-trap "rm -rf $WORK_DIR" EXIT
+KERNEL="tests/data/vmlinuz-6.19.10-200.fc43.x86_64"
+MODULE="tests/data/vfat.ko"
 
-echo "  Setting up self-signed module-only certificate..."
+setup()
+{
+    mkdir tests/test_key_db
+    cd tests/test_key_db
+    export NSS_DEFAULT_DB_TYPE=sql
+    certutil -d . -N --empty-password
+    cd -
+}
 
-# Create certificate database
-mkdir -m 0700 -p "$WORK_DIR/certdb"
-echo "" | certutil -d "$WORK_DIR/certdb" -N --empty-password
+cleanup() {
+    rm -fr tests/test_key_db >&/dev/null || :
+}
 
-# Generate self-signed module certificate
-./src/efikeygen --dbdir "$WORK_DIR/certdb" \
-    --self-sign \
-    --module \
-    --common-name 'CN=Test Module Signing Key' \
-    --nickname 'Test Module Key'
+# Verify that a certificate exists in the database and has trust flags set.
+verify_cert() {
+    local nickname="${1}" && shift
 
-# Verify certificate was created
-if ! certutil -d "$WORK_DIR/certdb" -L -n 'Test Module Key' > /dev/null 2>&1; then
-    echo "  ERROR: Certificate not created"
-    exit 1
-fi
+    echo -n "testing that certificate '${nickname}' was created: "
+    if ! certutil -d tests/test_key_db -L -n "${nickname}" >/dev/null 2>&1 ; then
+        echo "failure! ret:$?"
+        exit 1
+    fi
+    local trust
+    trust=$(certutil -d tests/test_key_db -L | grep "${nickname}" | awk '{print $NF}')
+    if [ -z "${trust}" ] ; then
+        echo "failure! no trust flags"
+        exit 1
+    fi
+    echo "success! (trust:${trust})"
+}
 
-# Export certificate
-certutil -d "$WORK_DIR/certdb" \
-    -n 'Test Module Key' \
-    -Lr \
-    > "$WORK_DIR/module_cert.cer"
+# Sign a file and check the result against the expected outcome.
+test_signing() {
+    local nickname="${1}" && shift
+    local infile="${1}" && shift
+    local what="${1}" && shift
+    local expected_result="${1}" && shift
 
-# Verify certificate file exists and is not empty
-if [ ! -s "$WORK_DIR/module_cert.cer" ]; then
-    echo "  ERROR: Certificate export failed"
-    exit 1
-fi
+    echo -n "testing ${what} signing with '${nickname}': "
+    case "${expected_result}" in
+        "pass")
+            if ! ./src/pesign --certdir tests/test_key_db \
+                    --certificate "${nickname}" \
+                    --sign --in "${infile}" \
+                    --out "tests/test_key_db/${what}-signed" ; then
+                echo "failure! ret:$?"
+                exit 1
+            fi
+            echo "success!"
+            ;;
+        "fail")
+            if ./src/pesign --certdir tests/test_key_db \
+                    --certificate "${nickname}" \
+                    --sign --in "${infile}" \
+                    --out "tests/test_key_db/${what}-signed" ; then
+                echo "failure! ret:$?"
+                exit 1
+            fi
+            echo "success!"
+            ;;
+        "warn")
+            if ./src/pesign --certdir tests/test_key_db \
+                    --certificate "${nickname}" \
+                    --sign --in "${infile}" \
+                    --out "tests/test_key_db/${what}-signed" ; then
+                echo "warning! signing was expected to be rejected but succeeded"
+            else
+                echo "success!"
+            fi
+            ;;
+    esac
+}
 
-echo "  ✓ Self-signed module certificate created successfully"
+main() {
+    trap cleanup INT QUIT SEGV ABRT ERR
+    cleanup
+    setup
 
-# Verify trust flags are set (should be u,u,u for user cert)
-TRUST=$(certutil -d "$WORK_DIR/certdb" -L | grep "Test Module Key" | awk '{print $NF}')
-if [ -z "$TRUST" ]; then
-    echo "  ✗ No trust flags found"
-    exit 1
-else
-    echo "  ✓ Trust flags: $TRUST"
-fi
+    while [ $# -ne 0 ]; do
+        case " $1 " in
+            " --disable-pqc ")
+                shift
+                ;;
+            *)
+                echo "unknown argument ${1}" >/dev/stderr
+                exit 1
+                ;;
+        esac
+    done
 
-# Get test data directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TEST_DATA="$SCRIPT_DIR/data"
+    # Generate a self-signed certificate for signing modules only.
+    ./src/efikeygen -d tests/test_key_db \
+        --self-sign --module \
+        --common-name 'CN=Test Module Signing Key' \
+        --nickname 'Test Module Key'
+    verify_cert 'Test Module Key'
 
-# Use real kernel and module files
-KERNEL="$TEST_DATA/vmlinuz-6.19.10-200.fc43.x86_64"
-MODULE="$TEST_DATA/vfat.ko"
+    # A module-signing certificate can sign modules.
+    test_signing 'Test Module Key' "${MODULE}" module pass
 
-# Test signing a kernel (should this work with module cert?)
-echo "  Testing kernel signing with module certificate..."
-if ./src/pesign --certdir "$WORK_DIR/certdb" \
-        --certificate 'Test Module Key' \
-        --in "$KERNEL" \
-        --sign \
-        --out "$WORK_DIR/kernel-signed" 2>"$WORK_DIR/kernel-error.log"; then
-    echo "  ⚠ Module cert signed kernel (exit 0)"
-    ./src/pesign --show-signature --in "$WORK_DIR/kernel-signed" 2>/dev/null | head -5
-else
-    echo "  ✓ Module cert rejected for kernel signing (exit $?)"
-    [ -s "$WORK_DIR/kernel-error.log" ] && cat "$WORK_DIR/kernel-error.log"
-fi
+    # A module-signing certificate should not be able to sign a kernel.
+    test_signing 'Test Module Key' "${KERNEL}" kernel warn
 
-# Test signing a module (should work)
-echo "  Testing module signing with module certificate..."
-if ./src/pesign --certdir "$WORK_DIR/certdb" \
-        --certificate 'Test Module Key' \
-        --in "$MODULE" \
-        --sign \
-        --out "$WORK_DIR/module-signed.ko" 2>"$WORK_DIR/module-error.log"; then
-    echo "  ✓ Module cert signed module (exit 0)"
-    ./src/pesign --show-signature --in "$WORK_DIR/module-signed.ko" 2>/dev/null | head -5
-else
-    echo "  ✗ Module cert failed to sign module (exit $?)"
-    [ -s "$WORK_DIR/module-error.log" ] && cat "$WORK_DIR/module-error.log"
-    exit 1
-fi
+    cleanup
+}
 
-exit 0
+main "${@}"
+
+# vim:fenc=utf-8:tw=75

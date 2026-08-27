@@ -31,11 +31,7 @@ deps all :
 $(SUBDIRS) :
 	$(MAKE) -C $@ all
 
-test : all
-	@echo "Running functional tests..."
-	@cd $(TOPDIR) && tests/run-tests.sh
-
-.PHONY: $(SUBDIRS) test
+.PHONY: $(SUBDIRS)
 
 GITTAG = $(VERSION)
 

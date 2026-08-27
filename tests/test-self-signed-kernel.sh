@@ -1,91 +1,111 @@
 #!/bin/bash
-# Test self-signed kernel signing certificate setup
-# Based on Red Hat documentation
+#
+# Copyright Gordon Messmer <gmessmer@redhat.com>
+#
+# Distributed under terms of the GPLv3 license.
+#
 
-set -e
+set -eu
+set -o pipefail
+export PS4='# ${BASH_SOURCE}:${LINENO} - [${SHLVL},${BASH_SUBSHELL},$?] '
 
-TEST_NAME="self-signed-kernel"
-WORK_DIR=$(mktemp -d)
-trap "rm -rf $WORK_DIR" EXIT
+KERNEL="tests/data/vmlinuz-6.19.10-200.fc43.x86_64"
+MODULE="tests/data/vfat.ko"
 
-echo "  Setting up self-signed kernel signing certificate..."
+setup()
+{
+    mkdir tests/test_key_db
+    cd tests/test_key_db
+    export NSS_DEFAULT_DB_TYPE=sql
+    certutil -d . -N --empty-password
+    cd -
+}
 
-# Create certificate database
-mkdir -m 0700 -p "$WORK_DIR/certdb"
-echo "" | certutil -d "$WORK_DIR/certdb" -N --empty-password
+cleanup() {
+    rm -fr tests/test_key_db >&/dev/null || :
+}
 
-# Generate self-signed kernel certificate
-./src/efikeygen --dbdir "$WORK_DIR/certdb" \
-    --self-sign \
-    --kernel \
-    --common-name 'CN=Test Kernel Signing Key' \
-    --nickname 'Test Kernel Key'
+# Verify that a certificate exists in the database and has trust flags set.
+verify_cert() {
+    local nickname="${1}" && shift
 
-# Verify certificate was created
-if ! certutil -d "$WORK_DIR/certdb" -L -n 'Test Kernel Key' > /dev/null 2>&1; then
-    echo "  ERROR: Certificate not created"
-    exit 1
-fi
+    echo -n "testing that certificate '${nickname}' was created: "
+    if ! certutil -d tests/test_key_db -L -n "${nickname}" >/dev/null 2>&1 ; then
+        echo "failure! ret:$?"
+        exit 1
+    fi
+    local trust
+    trust=$(certutil -d tests/test_key_db -L | grep "${nickname}" | awk '{print $NF}')
+    if [ -z "${trust}" ] ; then
+        echo "failure! no trust flags"
+        exit 1
+    fi
+    echo "success! (trust:${trust})"
+}
 
-# Export certificate
-certutil -d "$WORK_DIR/certdb" \
-    -n 'Test Kernel Key' \
-    -Lr \
-    > "$WORK_DIR/kernel_cert.cer"
+# Sign a file and check the result against the expected outcome.
+test_signing() {
+    local nickname="${1}" && shift
+    local infile="${1}" && shift
+    local what="${1}" && shift
+    local expected_result="${1}" && shift
 
-# Verify certificate file exists and is not empty
-if [ ! -s "$WORK_DIR/kernel_cert.cer" ]; then
-    echo "  ERROR: Certificate export failed"
-    exit 1
-fi
+    echo -n "testing ${what} signing with '${nickname}': "
+    case "${expected_result}" in
+        "pass")
+            if ! ./src/pesign --certdir tests/test_key_db \
+                    --certificate "${nickname}" \
+                    --sign --in "${infile}" \
+                    --out "tests/test_key_db/${what}-signed" ; then
+                echo "failure! ret:$?"
+                exit 1
+            fi
+            echo "success!"
+            ;;
+        "fail")
+            if ./src/pesign --certdir tests/test_key_db \
+                    --certificate "${nickname}" \
+                    --sign --in "${infile}" \
+                    --out "tests/test_key_db/${what}-signed" ; then
+                echo "failure! ret:$?"
+                exit 1
+            fi
+            echo "success!"
+            ;;
+    esac
+}
 
-echo "  ✓ Self-signed kernel certificate created successfully"
+main() {
+    trap cleanup INT QUIT SEGV ABRT ERR
+    cleanup
+    setup
 
-# Verify trust flags are set (should be u,u,u for user cert)
-TRUST=$(certutil -d "$WORK_DIR/certdb" -L | grep "Test Kernel Key" | awk '{print $NF}')
-if [ -z "$TRUST" ]; then
-    echo "  ✗ No trust flags found"
-    exit 1
-else
-    echo "  ✓ Trust flags: $TRUST"
-fi
+    while [ $# -ne 0 ]; do
+        case " $1 " in
+            " --disable-pqc ")
+                shift
+                ;;
+            *)
+                echo "unknown argument ${1}" >/dev/stderr
+                exit 1
+                ;;
+        esac
+    done
 
-# Get test data directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TEST_DATA="$SCRIPT_DIR/data"
+    # Generate a self-signed certificate for signing kernels.
+    ./src/efikeygen -d tests/test_key_db \
+        --self-sign --kernel \
+        --common-name 'CN=Test Kernel Signing Key' \
+        --nickname 'Test Kernel Key'
+    verify_cert 'Test Kernel Key'
 
-# Use real kernel and module files
-KERNEL="$TEST_DATA/vmlinuz-6.19.10-200.fc43.x86_64"
-MODULE="$TEST_DATA/vfat.ko"
+    # A kernel-signing certificate can sign both kernels and modules.
+    test_signing 'Test Kernel Key' "${KERNEL}" kernel pass
+    test_signing 'Test Kernel Key' "${MODULE}" module pass
 
-# Test signing a kernel (should work)
-echo "  Testing kernel signing with kernel certificate..."
-if ./src/pesign --certdir "$WORK_DIR/certdb" \
-        --certificate 'Test Kernel Key' \
-        --in "$KERNEL" \
-        --sign \
-        --out "$WORK_DIR/kernel-signed" 2>"$WORK_DIR/kernel-error.log"; then
-    echo "  ✓ Kernel cert signed kernel (exit 0)"
-    ./src/pesign --show-signature --in "$WORK_DIR/kernel-signed" 2>/dev/null | head -5
-else
-    echo "  ✗ Kernel cert failed to sign kernel (exit $?)"
-    [ -s "$WORK_DIR/kernel-error.log" ] && cat "$WORK_DIR/kernel-error.log"
-    exit 1
-fi
+    cleanup
+}
 
-# Test signing a module (kernel certs can sign modules)
-echo "  Testing module signing with kernel certificate..."
-if ./src/pesign --certdir "$WORK_DIR/certdb" \
-        --certificate 'Test Kernel Key' \
-        --in "$MODULE" \
-        --sign \
-        --out "$WORK_DIR/module-signed.ko" 2>"$WORK_DIR/module-error.log"; then
-    echo "  ✓ Kernel cert signed module (exit 0)"
-    ./src/pesign --show-signature --in "$WORK_DIR/module-signed.ko" 2>/dev/null | head -5
-else
-    echo "  ✗ Kernel cert failed to sign module (exit $?)"
-    [ -s "$WORK_DIR/module-error.log" ] && cat "$WORK_DIR/module-error.log"
-    exit 1
-fi
+main "${@}"
 
-exit 0
+# vim:fenc=utf-8:tw=75

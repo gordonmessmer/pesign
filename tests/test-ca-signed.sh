@@ -1,117 +1,124 @@
 #!/bin/bash
-# Test CA and signing certificate setup
-# Based on AlmaLinux documentation
+#
+# Copyright Gordon Messmer <gmessmer@redhat.com>
+#
+# Distributed under terms of the GPLv3 license.
+#
 
-set -e
+set -eu
+set -o pipefail
+export PS4='# ${BASH_SOURCE}:${LINENO} - [${SHLVL},${BASH_SUBSHELL},$?] '
 
-TEST_NAME="ca-signed"
-WORK_DIR=$(mktemp -d)
-trap "rm -rf $WORK_DIR" EXIT
+KERNEL="tests/data/vmlinuz-6.19.10-200.fc43.x86_64"
+MODULE="tests/data/vfat.ko"
 
-echo "  Setting up CA and signing certificates..."
+setup()
+{
+    mkdir tests/test_key_db
+    cd tests/test_key_db
+    export NSS_DEFAULT_DB_TYPE=sql
+    certutil -d . -N --empty-password
+    cd -
+}
 
-# Create certificate database
-mkdir -m 0700 -p "$WORK_DIR/ca"
-echo "" | certutil -d "$WORK_DIR/ca" -N --empty-password
+cleanup() {
+    rm -fr tests/test_key_db >&/dev/null || :
+}
 
-# Generate CA certificate
-./src/efikeygen -d "$WORK_DIR/ca" \
-    --ca --self-sign \
-    --not-valid-after=$(date +%s --date='+10 years') \
-    --nickname='Test Secure Boot CA' \
-    --common-name='CN=Test Secure Boot CA,O=Test Organization,E=test@example.com'
+# Verify that a certificate exists in the database and that its trust flags
+# match the supplied regular expression.
+verify_cert() {
+    local nickname="${1}" && shift
+    local trustre="${1}" && shift
 
-# Verify CA was created
-if ! certutil -d "$WORK_DIR/ca" -L -n 'Test Secure Boot CA' > /dev/null 2>&1; then
-    echo "  ERROR: CA certificate not created"
-    exit 1
-fi
+    echo -n "testing that certificate '${nickname}' was created: "
+    if ! certutil -d tests/test_key_db -L -n "${nickname}" >/dev/null 2>&1 ; then
+        echo "failure! ret:$?"
+        exit 1
+    fi
+    local trust
+    trust=$(certutil -d tests/test_key_db -L | grep "${nickname}" | awk '{print $NF}')
+    if ! echo "${trust}" | grep -qE "${trustre}" ; then
+        echo "failure! trust:${trust} does not match ${trustre}"
+        exit 1
+    fi
+    echo "success! (trust:${trust})"
+}
 
-# Generate signing certificate signed by CA (marked as --kernel)
-./src/efikeygen -d "$WORK_DIR/ca" \
-    --kernel \
-    --not-valid-after=$(date +%s --date='+10 years') \
-    --signer='Test Secure Boot CA' \
-    --nickname='Test Secure Boot Signing' \
-    --common-name='CN=Test Secure Boot Signing,O=Test Organization,E=test@example.com'
+# Sign a file and check the result against the expected outcome.
+test_signing() {
+    local nickname="${1}" && shift
+    local infile="${1}" && shift
+    local what="${1}" && shift
+    local expected_result="${1}" && shift
 
-# Verify signing certificate was created
-if ! certutil -d "$WORK_DIR/ca" -L -n 'Test Secure Boot Signing' > /dev/null 2>&1; then
-    echo "  ERROR: Signing certificate not created"
-    exit 1
-fi
+    echo -n "testing ${what} signing with '${nickname}': "
+    case "${expected_result}" in
+        "pass")
+            if ! ./src/pesign --certdir tests/test_key_db \
+                    --certificate "${nickname}" \
+                    --sign --in "${infile}" \
+                    --out "tests/test_key_db/${what}-signed" ; then
+                echo "failure! ret:$?"
+                exit 1
+            fi
+            echo "success!"
+            ;;
+        "fail")
+            if ./src/pesign --certdir tests/test_key_db \
+                    --certificate "${nickname}" \
+                    --sign --in "${infile}" \
+                    --out "tests/test_key_db/${what}-signed" ; then
+                echo "failure! ret:$?"
+                exit 1
+            fi
+            echo "success!"
+            ;;
+    esac
+}
 
-# Export certificates
-certutil -d "$WORK_DIR/ca" -L -n "Test Secure Boot CA" -r > "$WORK_DIR/test-secureboot-ca.cer"
-certutil -d "$WORK_DIR/ca" -L -n "Test Secure Boot Signing" -r > "$WORK_DIR/test-secureboot.cer"
+main() {
+    trap cleanup INT QUIT SEGV ABRT ERR
+    cleanup
+    setup
 
-# Verify certificate files exist and are not empty
-if [ ! -s "$WORK_DIR/test-secureboot-ca.cer" ]; then
-    echo "  ERROR: CA certificate export failed"
-    exit 1
-fi
+    while [ $# -ne 0 ]; do
+        case " $1 " in
+            " --disable-pqc ")
+                shift
+                ;;
+            *)
+                echo "unknown argument ${1}" >/dev/stderr
+                exit 1
+                ;;
+        esac
+    done
 
-if [ ! -s "$WORK_DIR/test-secureboot.cer" ]; then
-    echo "  ERROR: Signing certificate export failed"
-    exit 1
-fi
+    # Generate a self-signed CA certificate.
+    ./src/efikeygen -d tests/test_key_db \
+        --ca --self-sign \
+        --not-valid-after="$(date +%s --date='+10 years')" \
+        --common-name='CN=Test Secure Boot CA,O=Test Organization,E=test@example.com' \
+        --nickname='Test Secure Boot CA'
+    # A CA certificate must carry CA (C) or trusted-CA (T) trust flags.
+    verify_cert 'Test Secure Boot CA' 'C|T'
 
-echo "  ✓ CA and signing certificates created successfully"
+    # Generate a kernel-signing certificate signed by the CA.
+    ./src/efikeygen -d tests/test_key_db \
+        --kernel \
+        --not-valid-after="$(date +%s --date='+10 years')" \
+        --signer='Test Secure Boot CA' \
+        --common-name='CN=Test Secure Boot Signing,O=Test Organization,E=test@example.com' \
+        --nickname='Test Secure Boot Signing'
+    verify_cert 'Test Secure Boot Signing' '.'
 
-# Verify CA trust flags (CA cert should have CA trust)
-CA_TRUST=$(certutil -d "$WORK_DIR/ca" -L | grep "Test Secure Boot CA" | awk '{print $NF}')
-if echo "$CA_TRUST" | grep -q "C\|T"; then
-    echo "  ✓ CA trust flags: $CA_TRUST"
-else
-    echo "  ✗ CA trust flags missing CA trust: $CA_TRUST"
-    exit 1
-fi
+    # A CA-signed kernel-signing certificate can sign both kernels and modules.
+    test_signing 'Test Secure Boot Signing' "${KERNEL}" kernel pass
+    test_signing 'Test Secure Boot Signing' "${MODULE}" module pass
 
-# Verify signing cert trust flags
-SIGN_TRUST=$(certutil -d "$WORK_DIR/ca" -L | grep "Test Secure Boot Signing" | awk '{print $NF}')
-if [ -z "$SIGN_TRUST" ]; then
-    echo "  ✗ No trust flags found for signing cert"
-    exit 1
-else
-    echo "  ✓ Signing cert trust flags: $SIGN_TRUST"
-fi
+    cleanup
+}
 
-# Get test data directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TEST_DATA="$SCRIPT_DIR/data"
+main "${@}"
 
-# Use real kernel and module files
-KERNEL="$TEST_DATA/vmlinuz-6.19.10-200.fc43.x86_64"
-MODULE="$TEST_DATA/vfat.ko"
-
-# Test signing a kernel (should work - cert was created with --kernel)
-echo "  Testing kernel signing with CA-signed certificate..."
-if ./src/pesign --certdir "$WORK_DIR/ca" \
-        --certificate 'Test Secure Boot Signing' \
-        --in "$KERNEL" \
-        --sign \
-        --out "$WORK_DIR/kernel-signed" 2>"$WORK_DIR/kernel-error.log"; then
-    echo "  ✓ CA-signed cert signed kernel (exit 0)"
-    ./src/pesign --show-signature --in "$WORK_DIR/kernel-signed" 2>/dev/null | head -5
-else
-    echo "  ✗ CA-signed cert failed to sign kernel (exit $?)"
-    [ -s "$WORK_DIR/kernel-error.log" ] && cat "$WORK_DIR/kernel-error.log"
-    exit 1
-fi
-
-# Test signing a module (kernel certs can sign modules)
-echo "  Testing module signing with CA-signed certificate..."
-if ./src/pesign --certdir "$WORK_DIR/ca" \
-        --certificate 'Test Secure Boot Signing' \
-        --in "$MODULE" \
-        --sign \
-        --out "$WORK_DIR/module-signed.ko" 2>"$WORK_DIR/module-error.log"; then
-    echo "  ✓ CA-signed cert signed module (exit 0)"
-    ./src/pesign --show-signature --in "$WORK_DIR/module-signed.ko" 2>/dev/null | head -5
-else
-    echo "  ✗ CA-signed cert failed to sign module (exit $?)"
-    [ -s "$WORK_DIR/module-error.log" ] && cat "$WORK_DIR/module-error.log"
-    exit 1
-fi
-
-exit 0
+# vim:fenc=utf-8:tw=75
